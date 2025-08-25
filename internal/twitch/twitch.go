@@ -27,15 +27,21 @@ type ChatMessage struct {
 	Raw     string
 }
 
-// Listen starts a background loop that connects (and reconnects) to Twitch IRC,
-// and pushes incoming PRIVMSG messages onto the returned channel.
-// Close everything by canceling ctx. Both channels will be closed on exit.
+// Listen connects to Twitch IRC and streams chat messages.
+// It returns two channels:
+//   - ChatMessage channel with incoming messages
+//   - error channel for connection or parsing errors
+// Callers should stop listening by canceling the provided context.
 func Listen(ctx context.Context, cfg Config) (<-chan ChatMessage, <-chan error, error) {
+	// Ensure config has the required fields
 	if cfg.Username == "" || cfg.Token == "" || cfg.Channel == "" {
-		return nil, nil, fmt.Errorf("missing cfg fields: Username: %s, Token: %s, Channel: %s are required", cfg.Username, cfg.Token, cfg.Channel)
+		return nil, nil, fmt.Errorf(
+			"missing cfg fields: Username=%q, Token=%q, Channel=%q must all be set",
+			cfg.Username, cfg.Token, cfg.Channel,
+		)
 	}
 
-	msgCh := make(chan ChatMessage, 256) // bump if you expect bursts
+	msgCh := make(chan ChatMessage, 256) // buffered for bursts
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -43,22 +49,28 @@ func Listen(ctx context.Context, cfg Config) (<-chan ChatMessage, <-chan error, 
 		defer close(errCh)
 
 		backoff := time.Second
+
 		for {
+			// One connection attempt
 			if err := runOnce(ctx, cfg, msgCh); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
+				// Non-blocking send to errCh
 				select {
 				case errCh <- err:
 				default:
 				}
 			}
 
+			// Exit on context cancel, otherwise backoff before retry
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
 			}
+
+			// Exponential backoff up to 30s
 			if backoff < 30*time.Second {
 				backoff *= 2
 			}
@@ -68,6 +80,7 @@ func Listen(ctx context.Context, cfg Config) (<-chan ChatMessage, <-chan error, 
 	return msgCh, errCh, nil
 }
 
+// runOnce performs one Twitch IRC connection and runs until disconnected.
 func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", twitchHost, &tls.Config{})
@@ -81,7 +94,7 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 		return err
 	}
 
-	// auth + caps + join
+	// Authenticate and join channel
 	if err := write("PASS " + cfg.Token); err != nil {
 		return err
 	}
@@ -97,9 +110,11 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 
 	reader := bufio.NewReader(conn)
 	errCh := make(chan error, 1)
+
 	pingTicker := time.NewTicker(4 * time.Minute)
 	defer pingTicker.Stop()
 
+	// Reader goroutine
 	go func() {
 		for {
 			line, e := reader.ReadString('\n')
@@ -109,7 +124,7 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 			}
 			line = strings.TrimRight(line, "\r\n")
 
-			// PING -> PONG
+			// Respond to server pings
 			if strings.HasPrefix(line, "PING ") {
 				_ = write(strings.Replace(line, "PING", "PONG", 1))
 				continue
@@ -120,23 +135,27 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 			case "RECONNECT":
 				errCh <- fmt.Errorf("server requested RECONNECT")
 				return
+
 			case "PRIVMSG":
-				var ch string
+				ch := ""
 				if len(msg.Params) > 0 {
 					ch = msg.Params[0]
 				}
-				display := msg.Tags["display-name"]
-				if display == "" {
-					display = nickFromPrefix(msg.Prefix)
+				user := msg.Tags["display-name"]
+				if user == "" {
+					user = nickFromPrefix(msg.Prefix)
 				}
-				select {
-				case out <- ChatMessage{
+
+				chatMsg := ChatMessage{
 					Channel: ch,
-					User:    display,
+					User:    user,
 					Text:    msg.Trailing,
 					Tags:    msg.Tags,
 					Raw:     msg.Raw,
-				}:
+				}
+
+				select {
+				case out <- chatMsg:
 				case <-ctx.Done():
 					return
 				}
@@ -144,6 +163,7 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 		}
 	}()
 
+	// Main loop: handle ctx, ping keepalive, or reader errors
 	for {
 		select {
 		case <-ctx.Done():
@@ -158,7 +178,7 @@ func runOnce(ctx context.Context, cfg Config, out chan<- ChatMessage) error {
 	}
 }
 
-// --- minimal IRC parsing helpers ---
+// --- IRC parsing helpers ---
 
 type ircMessage struct {
 	Raw      string
@@ -169,16 +189,17 @@ type ircMessage struct {
 	Trailing string
 }
 
+// parseIRC decodes a raw IRC line into structured fields.
 func parseIRC(raw string) ircMessage {
 	msg := ircMessage{Raw: raw, Tags: map[string]string{}}
 	rest := raw
 
-	// tags
+	// Parse tags (e.g., @badge-info=…)
 	if strings.HasPrefix(rest, "@") {
 		if sp := strings.Index(rest, " "); sp != -1 {
 			tagPart := rest[1:sp]
 			rest = strings.TrimSpace(rest[sp+1:])
-			for kv := range strings.SplitSeq(tagPart, ";") {
+			for _, kv := range strings.Split(tagPart, ";") {
 				if kv == "" {
 					continue
 				}
@@ -191,7 +212,7 @@ func parseIRC(raw string) ircMessage {
 		}
 	}
 
-	// prefix
+	// Parse prefix (e.g., :nickname!)
 	if strings.HasPrefix(rest, ":") {
 		if sp := strings.Index(rest, " "); sp != -1 {
 			msg.Prefix = rest[1:sp]
@@ -201,7 +222,7 @@ func parseIRC(raw string) ircMessage {
 		}
 	}
 
-	// command
+	// Parse command
 	if sp := strings.Index(rest, " "); sp != -1 {
 		msg.Cmd = rest[:sp]
 		rest = strings.TrimSpace(rest[sp+1:])
@@ -210,24 +231,24 @@ func parseIRC(raw string) ircMessage {
 		return msg
 	}
 
-	// params + trailing
+	// Params + trailing message
 	if i := strings.Index(rest, " :"); i != -1 {
-		params := strings.TrimSpace(rest[:i])
-		if params != "" {
+		if params := strings.TrimSpace(rest[:i]); params != "" {
 			msg.Params = strings.Split(params, " ")
 		}
 		msg.Trailing = rest[i+2:]
-	} else {
-		if rest != "" {
-			msg.Params = strings.Split(rest, " ")
-		}
+	} else if rest != "" {
+		msg.Params = strings.Split(rest, " ")
 	}
+
 	return msg
 }
 
+// nickFromPrefix extracts the nickname from an IRC prefix.
 func nickFromPrefix(prefix string) string {
 	if i := strings.Index(prefix, "!"); i > 0 {
 		return prefix[:i]
 	}
 	return prefix
 }
+
